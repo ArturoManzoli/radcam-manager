@@ -8,6 +8,7 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     BlueSlider: typeof import('./src/components/BlueSlider.vue')['default']
+    BlueSwitch: typeof import('./src/components/BlueSwitch.vue')['default']
     ImageTab: typeof import('./src/components/ImageTab.vue')['default']
     OperationError: typeof import('./src/components/common/OperationError.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
