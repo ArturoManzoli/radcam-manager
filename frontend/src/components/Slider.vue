@@ -10,10 +10,7 @@
       :step="step"
       :disabled="disabled"
       hide-details
-      @mousedown="startSliding"
-      @touchstart.passive="startSliding"
-      @mouseup="stopSliding"
-      @touchend="stopSliding"
+      @pointerdown="startSliding"
       @input="onSliderInput"
     >
       <template #append>
@@ -25,6 +22,9 @@
           width="90px"
           hide-details
           single-line
+          :disabled="disabled"
+          @change="onNumberCommit"
+          @blur="onNumberCommit"
         />
       </template>
     </v-slider>
@@ -44,7 +44,7 @@ const props = withDefaults(defineProps<{
   disabled?: boolean
 }>(), {
   step: 1,
-  disabbled: false
+  disabled: false
 })
 
 const current = ref(props.current)
@@ -56,10 +56,14 @@ let sliderInterval: number | null = null
 let isSliding = false
 
 watch(() => props.current, (newVal) => {
-  current.value = newVal;
-});
+  if (isSliding) return
+  current.value = newVal
+  lastSentValue.value = newVal
+})
 
 onBeforeUnmount(() => {
+  window.removeEventListener('pointerup', stopSliding)
+  window.removeEventListener('pointercancel', stopSliding)
   if (sliderInterval) {
     clearInterval(sliderInterval)
     sliderInterval = null
@@ -82,8 +86,16 @@ const onSliderInput = () => {
 
 }
 
+const onNumberCommit = () => {
+  current.value = Math.min(Math.max(current.value, props.min), props.max)
+  sendValue(current.value)
+}
+
 const startSliding = () => {
+  if (props.disabled || isSliding) return
   isSliding = true
+  window.addEventListener('pointerup', stopSliding)
+  window.addEventListener('pointercancel', stopSliding)
   if (!sliderInterval) {
     sliderInterval = setInterval(() => {
       if (isSliding) {
@@ -94,7 +106,10 @@ const startSliding = () => {
 }
 
 const stopSliding = () => {
+  if (!isSliding) return
   isSliding = false
+  window.removeEventListener('pointerup', stopSliding)
+  window.removeEventListener('pointercancel', stopSliding)
   if (sliderInterval) {
     clearInterval(sliderInterval)
     sliderInterval = null

@@ -1,15 +1,23 @@
 use anyhow::Result;
 use tracing::*;
 
-use radcam_manager::{logger, web};
+use br4kcam_manager::{
+    logger,
+    web::{self, ShutdownReason},
+};
 
 pub mod cli;
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+async fn start_application(first_start: bool) -> Result<bool> {
     cli::init();
 
     logger::init(cli::log_path(), cli::is_verbose(), cli::is_tracing());
+
+    autopilot::set_backend_version(format!(
+        "{}-{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("?"),
+    ));
 
     info!(
         "{}, version: {}-{}, build date: {}",
@@ -25,29 +33,75 @@ async fn main() -> Result<()> {
     debug!("Command line call: {}", cli::command_line_string());
     debug!("Command line input struct call: {}", cli::command_line());
 
-    settings::init(cli::settings_file(), cli::is_reset())
+    settings::init(cli::settings_file(), first_start && cli::is_reset())
         .await
         .unwrap();
 
-    let mcm_client_startup_task = tokio::spawn(mcm_client::init(cli::mcm_address().await));
+    let mcm_client_startup_task = tokio::spawn(mcm_client::init(
+        cli::mcm_address().await,
+        cli::mcm_skip_hardware_check(),
+    ));
 
     blueos_client::init(cli::blueos_address().await).await;
 
     let autopilot_startup_task = tokio::spawn(async move {
+        let mut endpoint_failures = 0u32;
         loop {
-            if let Err(error) =
-                blueos_client::create_mavlink_endpoint(&cli::mavlink_connection_string().await)
-                    .await
+            match blueos_client::create_mavlink_endpoint(&cli::mavlink_connection_string().await)
+                .await
             {
-                error!("Failed creating MAVLink Endpoint: {error:?}");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
+                Ok(()) => {
+                    autopilot::report_endpoint_setup(true, None);
+                    info!("Successfully created MAVLink endpoint!");
+                    break;
+                }
+                Err(error) => {
+                    let detail = format!("{error:?}");
+                    autopilot::report_endpoint_setup(false, Some(detail.clone()));
+                    if endpoint_failures == 0 {
+                        error!("Failed creating MAVLink Endpoint: {detail}");
+                    } else {
+                        warn!("Failed creating MAVLink Endpoint: {detail}");
+                    }
+                    endpoint_failures += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
             }
-
-            info!("Successfully created MAVLink endpoint!");
-
-            break;
         }
+
+        // BlueOS users can delete our endpoint at runtime; re-create it while
+        // MAVLink is down so traffic can resume without restarting this process.
+        tokio::spawn(async move {
+            let mut warned = false;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                if !autopilot::needs_mavlink_endpoint_ensure() {
+                    warned = false;
+                    continue;
+                }
+                match blueos_client::ensure_mavlink_endpoint(
+                    &cli::mavlink_connection_string().await,
+                )
+                .await
+                {
+                    Ok(changed) => {
+                        autopilot::report_endpoint_setup(true, None);
+                        if changed {
+                            info!("Re-created BlueOS MAVLink endpoint");
+                        }
+                        warned = false;
+                    }
+                    Err(error) => {
+                        let detail = format!("{error:?}");
+                        autopilot::report_endpoint_setup(false, Some(detail.clone()));
+                        if !warned {
+                            warn!("Failed re-ensuring MAVLink endpoint: {detail}");
+                            warned = true;
+                        }
+                    }
+                }
+            }
+        });
 
         loop {
             if let Err(error) = autopilot::init(
@@ -69,10 +123,27 @@ async fn main() -> Result<()> {
         }
     });
 
-    web::run(cli::web_server().await, cli::default_api_version()).await;
+    let shutdown_reason = web::run(cli::web_server().await, cli::default_api_version()).await;
 
     autopilot_startup_task.abort();
     mcm_client_startup_task.abort();
+    mcm_client::shutdown().await;
+    autopilot::shutdown_actuators_stream().await;
+
+    if shutdown_reason == ShutdownReason::Signal {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    let mut first_start = true;
+
+    while start_application(first_start).await? {
+        first_start = false;
+    }
 
     Ok(())
 }

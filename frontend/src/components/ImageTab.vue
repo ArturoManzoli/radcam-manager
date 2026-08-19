@@ -92,17 +92,17 @@
     <div class="ma-2 text-right">
       <v-btn
         variant="tonal"
-        :disabled="props.disabled || processingWhiteBalance"
+        :disabled="props.disabled || wbBusy"
         @click="doWhiteBalance"
       >
         <v-progress-circular
-          v-if="processingWhiteBalance"
+          v-if="wbBusy"
           indeterminate
           color="white"
           size="20"
           class="me-2"
         />
-        {{ processingWhiteBalance ? "Processing..." : "One-Push White Balance" }}
+        {{ onePushLabel }}
       </v-btn>
     </div>
   </div>
@@ -118,7 +118,7 @@
           :model-value="baseParams.auto_awb"
           :items="autoWhiteBalanceModeOptions"
           label="White Balance Mode"
-          :disabled="props.disabled"
+          :disabled="props.disabled || wbBusy"
           item-title="text"
           item-value="value"
           class="mb-4"
@@ -129,7 +129,7 @@
           :model-value="baseParams.awb_auto_mode"
           :items="autoWhiteBalanceSceneOptions"
           label="White Balance Scene"
-          :disabled="props.disabled"
+          :disabled="props.disabled || wbBusy"
           item-title="text"
           item-value="value"
           class="mb-4"
@@ -145,7 +145,7 @@
             :min="0"
             :max="255"
             :step="1"
-            :disabled="props.disabled"
+            :disabled="props.disabled || wbBusy"
             @update:current="updateBaseParameter('awb_red', $event)"
           />
           <Slider
@@ -155,7 +155,7 @@
             :min="0"
             :max="255"
             :step="1"
-            :disabled="props.disabled"
+            :disabled="props.disabled || wbBusy"
             @update:current="updateBaseParameter('awb_green', $event)"
           />
           <Slider
@@ -165,7 +165,7 @@
             :min="0"
             :max="255"
             :step="1"
-            :disabled="props.disabled"
+            :disabled="props.disabled || wbBusy"
             @update:current="updateBaseParameter('awb_blue', $event)"
           />
         </div>
@@ -176,7 +176,7 @@
           :min="0"
           :max="255"
           :step="1"
-          :disabled="props.disabled"
+          :disabled="props.disabled || wbBusy"
           @update:current="updateBaseParameter('awb_style_red', $event)"
         />
         <Slider
@@ -186,7 +186,7 @@
           :min="0"
           :max="255"
           :step="1"
-          :disabled="props.disabled"
+          :disabled="props.disabled || wbBusy"
           @update:current="updateBaseParameter('awb_style_green', $event)"
         />
         <Slider
@@ -196,7 +196,7 @@
           :min="0"
           :max="255"
           :step="1"
-          :disabled="props.disabled"
+          :disabled="props.disabled || wbBusy"
           @update:current="updateBaseParameter('awb_style_blue', $event)"
         />
       </v-expansion-panel-text>
@@ -724,20 +724,28 @@ import {
     AdvancedDisplayLowFramerateValue,
     AdvancedDisplayLedControlValue,  
     AdvancedDisplaySceneModeValue
-} from '@/bindings/radcam'
+} from '@/bindings/br4kcam'
 
 
 import { enumToOptions } from '@/utils/enumUtils'
-import axios from 'axios'
-import { onMounted, ref, watch } from 'vue'
+import { backendClient } from '@/utils/backendClient'
+import { useCameraState } from '@/utils/useCameraState'
+import { createPendingFields } from '@/utils/pendingFields'
+import type { OnePushAwbStatus } from '@/bindings/br4kcam_api'
+import { computed, ref, toRef, watch } from 'vue'
 
 const props = defineProps<{
   selectedCameraUuid: string | null
-  backendApi: string,
   disabled: boolean
+  onePushAwb?: OnePushAwbStatus | null
 }>()
 
-const processingWhiteBalance = ref(false)
+const wbBusy = computed(() => props.onePushAwb != null)
+const onePushLabel = computed(() => {
+  if (props.onePushAwb != null) return 'Processing...'
+  return 'One-Push White Balance'
+})
+
 const processingBaseRestore = ref(false)
 const processingAdvancedRestore = ref(false)
 
@@ -848,19 +856,40 @@ const noiseReductionOptions = enumToOptions(AdvancedDisplayNoiseReductionValue)
 const _2dNrLevelOptions = enumToOptions(AdvancedDisplay2dNrLevelValue)
 const antiFlickerOptions = enumToOptions(AdvancedDisplayAntiflickerValue)
 
-onMounted(() => {
-  getBaseParameters()
-  getAdvancedParameters()
-})
+const imageRequestGeneration = ref(0)
+const pendingBase = createPendingFields<keyof BaseParameterSetting, unknown>()
+const pendingAdvanced = createPendingFields<keyof AdvancedParameterSetting, unknown>()
+
+const applyCameraStateEvent = (body: unknown) => {
+  if (!props.selectedCameraUuid) return
+  if (typeof body !== 'object' || body === null) return
+
+  const data = body as Record<string, unknown>
+  if (data.camera_uuid !== props.selectedCameraUuid) return
+
+  if (data.base_parameters) {
+    baseParams.value = pendingBase.mergeRemote(
+      data.base_parameters as BaseParameterSetting,
+    )
+  }
+  if (data.advanced_parameters) {
+    advancedParams.value = pendingAdvanced.mergeRemote(
+      data.advanced_parameters as AdvancedParameterSetting,
+    )
+  }
+}
+
+useCameraState(toRef(props, 'selectedCameraUuid'), applyCameraStateEvent)
 
 watch(
   () => props.selectedCameraUuid,
-  async (newValue) => {
-    if (newValue) {
-      getBaseParameters()
-      getAdvancedParameters()
-    }
-  }
+  () => {
+    imageRequestGeneration.value += 1
+    pendingBase.clear()
+    pendingAdvanced.clear()
+    processingBaseRestore.value = false
+    processingAdvancedRestore.value = false
+  },
 )
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -869,8 +898,14 @@ const updateBaseParameter = (param: keyof BaseParameterSetting, value: any) => {
     return
   }
 
+  const cameraUuid = props.selectedCameraUuid
+  const generation = imageRequestGeneration.value
+  const previous = baseParams.value[param]
+  const { token, epoch } = pendingBase.begin(param, previous, value)
+  baseParams.value = { ...baseParams.value, [param]: value }
+
   const payload = {
-    camera_uuid: props.selectedCameraUuid,
+    camera_uuid: cameraUuid,
     action: "setImageAdjustment",
     json: {
       [param]: value,
@@ -879,12 +914,36 @@ const updateBaseParameter = (param: keyof BaseParameterSetting, value: any) => {
 
   console.log(payload)
 
-  axios.post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      baseParams.value = response.data as BaseParameterSetting
+  backendClient.request('POST', '/camera/control', payload)
+    .then(data => {
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      const incoming = data as BaseParameterSetting
+      pendingBase.settleSuccess(param, token, epoch, () => {
+        baseParams.value = pendingBase.mergeRemote(incoming)
+      })
     })
     .catch(error => {
       console.error(`Error sending ${String(param)} control with value '${value}':`, error.message)
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      pendingBase.settleFail(
+        param,
+        token,
+        epoch,
+        (attempted) => baseParams.value[param] === attempted,
+        (prev) => {
+          baseParams.value = { ...baseParams.value, [param]: prev as BaseParameterSetting[typeof param] }
+        },
+      )
     })
 }
 
@@ -893,15 +952,25 @@ const getBaseParameters = () => {
     return
   }
 
+  const cameraUuid = props.selectedCameraUuid
+  const generation = imageRequestGeneration.value
   const payload = {
-    camera_uuid: props.selectedCameraUuid,
+    camera_uuid: cameraUuid,
     action: "getImageAdjustment",
   }
 
-  axios.post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      baseParams.value = response.data as BaseParameterSetting
-      console.log(response.data)
+  backendClient.request('POST', '/camera/control', payload)
+    .then(data => {
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      baseParams.value = pendingBase.mergeRemote(
+        data as BaseParameterSetting,
+      )
+      console.log(data)
     })
     .catch(error => {
       console.error(`Error sending getImageAdjustment request:`, error.message)
@@ -909,13 +978,9 @@ const getBaseParameters = () => {
 }
 
 const doWhiteBalance = async () => {
-  if (!props.selectedCameraUuid) {
+  if (!props.selectedCameraUuid || props.disabled || wbBusy.value) {
     return
   }
-
-  // Prevent multiple concurrent white balance operations
-  if (processingWhiteBalance.value) return
-  processingWhiteBalance.value = true
 
   const payload: CameraControl = {
     camera_uuid: props.selectedCameraUuid,
@@ -925,12 +990,9 @@ const doWhiteBalance = async () => {
     } as AdvancedParameterSetting,
   }
 
-  axios.post(`${props.backendApi}/camera/control`, payload)
+  backendClient.request('POST', '/camera/control', payload)
     .catch(error => {
       console.error("Error sending onceAWB control:", error.message)
-    }).finally(() => {
-      processingWhiteBalance.value = false
-      getBaseParameters()
     })
 }
 
@@ -941,41 +1003,34 @@ const doRestoreBase = async () => {
 
   processingBaseRestore.value = true
 
+  const cameraUuid = props.selectedCameraUuid
+  const generation = imageRequestGeneration.value
+  pendingBase.beginRestore()
   const payload: CameraControl = {
-    camera_uuid: props.selectedCameraUuid,
+    camera_uuid: cameraUuid,
     action: "setImageAdjustment",
     json: {
       set_default: 1,
     } as BaseParameterSetting,
   }
 
-  axios
-    .post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      baseParams.value = response.data as BaseParameterSetting
+  backendClient
+    .request('POST', '/camera/control', payload)
+    .then(data => {
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      baseParams.value = pendingBase.mergeRemote(data as BaseParameterSetting)
     })
     .catch(error => {
       console.error("Error sending base image restore control:", error.message)
     })
     .finally(() => {
+      if (generation !== imageRequestGeneration.value) return
       processingBaseRestore.value = false
-    })
-}
-
-const getAdvancedParameters = () => {
-  if (!props.selectedCameraUuid) return
-
-  const payload = {
-    camera_uuid: props.selectedCameraUuid,
-    action: "getImageAdjustmentEx",
-  }
-
-  axios.post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      advancedParams.value = response.data as AdvancedParameterSetting
-    })
-    .catch(error => {
-      console.error("Error fetching advanced parameters:", error.message)
     })
 }
 
@@ -983,18 +1038,51 @@ const getAdvancedParameters = () => {
 const updateAdvancedParam = (param: keyof AdvancedParameterSetting, value: any) => {
   if (!props.selectedCameraUuid) return
 
+  const cameraUuid = props.selectedCameraUuid
+  const generation = imageRequestGeneration.value
+  const previous = advancedParams.value[param]
+  const { token, epoch } = pendingAdvanced.begin(param, previous, value)
+  advancedParams.value = { ...advancedParams.value, [param]: value }
+
   const payload: CameraControl = {
-    camera_uuid: props.selectedCameraUuid,
+    camera_uuid: cameraUuid,
     action: "setImageAdjustmentEx",
     json: { [param]: value } as AdvancedParameterSetting
   }
 
-  axios.post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      advancedParams.value = { ...advancedParams.value, ...response.data }
+  backendClient.request('POST', '/camera/control', payload)
+    .then(data => {
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      const incoming = data as AdvancedParameterSetting
+      pendingAdvanced.settleSuccess(param, token, epoch, () => {
+        advancedParams.value = pendingAdvanced.mergeRemote(incoming)
+      })
     })
     .catch(error => {
       console.error(`Error updating ${param}:`, error.message)
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      pendingAdvanced.settleFail(
+        param,
+        token,
+        epoch,
+        (attempted) => advancedParams.value[param] === attempted,
+        (prev) => {
+          advancedParams.value = {
+            ...advancedParams.value,
+            [param]: prev as AdvancedParameterSetting[typeof param],
+          }
+        },
+      )
     })
 }
 
@@ -1003,20 +1091,30 @@ const doRestoreAdvanced = async () => {
 
   processingAdvancedRestore.value = true
 
+  const cameraUuid = props.selectedCameraUuid
+  const generation = imageRequestGeneration.value
+  pendingAdvanced.beginRestore()
   const payload: CameraControl = {
-    camera_uuid: props.selectedCameraUuid,
+    camera_uuid: cameraUuid,
     action: "setImageAdjustmentEx",
     json: { set_default: 1 } as AdvancedParameterSetting
   }
 
-  axios.post(`${props.backendApi}/camera/control`, payload)
-    .then(response => {
-      advancedParams.value = response.data as AdvancedParameterSetting
+  backendClient.request('POST', '/camera/control', payload)
+    .then(data => {
+      if (
+        props.selectedCameraUuid !== cameraUuid ||
+        generation !== imageRequestGeneration.value
+      ) {
+        return
+      }
+      advancedParams.value = pendingAdvanced.mergeRemote(data as AdvancedParameterSetting)
     })
     .catch(error => {
       console.error("Error restoring advanced parameters:", error.message)
     })
     .finally(() => {
+      if (generation !== imageRequestGeneration.value) return
       processingAdvancedRestore.value = false
     })
 }

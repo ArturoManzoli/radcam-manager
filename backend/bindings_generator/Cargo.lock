@@ -148,7 +148,7 @@ name = "bindings"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "radcam_commands",
+ "br4kcam_commands",
  "regex",
  "ts-rs",
 ]
@@ -1019,7 +1019,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "radcam_commands"
+name = "br4kcam_commands"
 version = "0.1.0"
 dependencies = [
  "anyhow",

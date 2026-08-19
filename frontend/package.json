@@ -1,14 +1,15 @@
 {
-  "name": "radcam-manager-frontend",
+  "name": "br4kcam-manager-frontend",
   "private": true,
   "type": "module",
-  "version": "0.2.0-beta.14",
+  "version": "0.3.0",
   "scripts": {
     "dev": "vite",
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "build-only": "vite build",
     "type-check": "vue-tsc --build --force",
+    "selfcheck": "tsx src/utils/runSelfChecks.ts",
     "lint": "eslint . --fix"
   },
   "dependencies": {
@@ -16,7 +17,6 @@
     "@tailwindcss/vite": "^4.1.11",
     "@vueuse/core": "^13.7.0",
     "@vueuse/router": "^13.7.0",
-    "axios": "^1.7.9",
     "core-js": "^3.37.1",
     "roboto-fontface": "*",
     "tailwindcss": "^4.1.11",
@@ -37,8 +37,8 @@
     "npm-run-all2": "^7.0.2",
     "sass": "1.77.8",
     "sass-embedded": "^1.77.8",
+    "tsx": "4.19.2",
     "typescript": "~5.6.3",
-    "unplugin-fonts": "^1.1.1",
     "unplugin-vue-components": "^0.27.2",
     "vite": "^5.4.10",
     "vite-plugin-vuetify": "^2.0.3",

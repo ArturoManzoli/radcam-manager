@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use mavlink::{
     MavHeader,
@@ -92,10 +92,15 @@ impl MavlinkComponent {
 
             let encoding_c_cast = data
                 .capabilities
-                .contains(MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT)
-                || data
-                    .capabilities
-                    .contains(MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_C_CAST);
+                .contains(MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_C_CAST)
+                || {
+                    // Deprecated alias of C_CAST (renamed 2022-03); still set by some stacks.
+                    #[allow(deprecated)]
+                    {
+                        data.capabilities
+                            .contains(MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT)
+                    }
+                };
             let encoding_bytewise = data
                 .capabilities
                 .contains(MavProtocolCapability::MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_BYTEWISE);
@@ -114,10 +119,19 @@ impl MavlinkComponent {
                     break ParamEncodingType::ByteWise;
                 }
                 (false, false) => {
+                    // Spec: either bit *should* be set if params are supported, but the
+                    // protocol may still be used with prior knowledge of the component
+                    // (https://mavlink.io/en/services/parameter.html#protocol-discovery).
+                    // ArduPilot uses C-cast encoding and does *not* set
+                    // MAV_PROTOCOL_CAPABILITY_PARAM_ENCODE_C_CAST
+                    // (https://mavlink.io/en/services/parameter.html#ardupilot).
+                    // Storing Unsupported here made Parameter::try_new fail for every
+                    // PARAM_VALUE, so update_all_params never finished and MANAGER
+                    // never registered — settings.json stayed out of sync with runtime.
                     error!(
-                        "Unexpected value: None of the C_CAST and BYTEWISE encodings are set by the Autopilot. Assuming C_CAST, then."
+                        "Neither PARAM_ENCODE_C_CAST nor PARAM_ENCODE_BYTEWISE set; assuming C_CAST (ArduPilot)"
                     );
-                    break ParamEncodingType::Unsupported;
+                    break ParamEncodingType::CCast;
                 }
             }
         };
@@ -225,14 +239,17 @@ impl MavlinkComponent {
         }
 
         *inner.parameters.write().await = parameters;
+        let cache = inner.parameters.read().await;
+        crate::manager::owned_parameters::establish_baseline_from_cache(&cache);
     }
 
     #[instrument(level = "debug", skip(inner))]
     pub(crate) async fn params_sync_task(inner: Arc<ComponentInner>) {
         let mut receiver = inner.get_receiver().await;
-        let encoding = *inner.encoding.read().await;
 
         loop {
+            let encoding = *inner.encoding.read().await;
+
             let (_header, message) = match receiver.recv().await {
                 Ok(Message::Received(inner)) => inner,
                 Ok(Message::ToBeSent(_)) => continue,
@@ -255,19 +272,19 @@ impl MavlinkComponent {
                 }
             };
 
-            inner
-                .parameters
-                .write()
-                .await
+            observe_param_value_from_sync(&parameter, data.param_index);
+
+            let mut cache = inner.parameters.write().await;
+            cache
                 .entry(parameter.name.clone())
-                .and_modify(|v| {
-                    if v.value != parameter.value && v.name != "STAT_RUNTIME" {
+                .and_modify(|existing| {
+                    if existing.value != parameter.value && existing.name != "STAT_RUNTIME" {
                         debug!(
                             "Parameter {:?} updated from {:?} to {:?}",
-                            v.name, v.value, parameter.value,
+                            existing.name, existing.value, parameter.value,
                         );
                     }
-                    *v = parameter.clone()
+                    *existing = parameter.clone();
                 })
                 .or_insert_with(|| {
                     trace!("New parameter added: {parameter:?}");
@@ -278,7 +295,13 @@ impl MavlinkComponent {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn get_param(&self, param_name: &str, skip_cache: bool) -> Result<Parameter> {
-        Self::get_param_inner(self.inner.clone(), param_name, skip_cache).await
+        if !skip_cache && let Some(parameter) = self.inner.parameters.read().await.get(param_name) {
+            trace!("Got parameter from cache!");
+            return Ok(parameter.clone());
+        }
+
+        let _txn = self.inner.txn.lock().await;
+        Self::get_param_inner(self.inner.clone(), param_name, true).await
     }
 
     #[instrument(level = "debug", skip(inner))]
@@ -404,6 +427,7 @@ impl MavlinkComponent {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn set_param(&self, parameter: Parameter) -> Result<Parameter> {
+        let _txn = self.inner.txn.lock().await;
         Self::set_param_inner(self.inner.clone(), parameter).await
     }
 
@@ -432,9 +456,17 @@ impl MavlinkComponent {
             param_type: parameter.param_type(),
         });
 
+        let mut send_retries = 5;
         loop {
             if let Err(error) = sender.send(Message::ToBeSent((header, message.clone()))) {
-                warn!("Failed requesting parameter: {error:?}");
+                send_retries -= 1;
+                if send_retries == 0 {
+                    return Err(anyhow!(
+                        "Failed sending PARAM_SET for {}: {error:?}",
+                        parameter.name
+                    ));
+                }
+                warn!("Failed sending PARAM_SET: {error:?}");
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 continue;
@@ -443,24 +475,25 @@ impl MavlinkComponent {
             let recv_parameter = match Self::wait_for_param(inner.clone(), &parameter.name).await {
                 Ok(parameter) => parameter,
                 Err(error) => {
-                    warn!("Failed getting parameter: {error:?}");
-
-                    continue;
+                    // wait_for_param already exhausted its retries; do not loop
+                    // forever here (that held MANAGER.write() for tens of seconds).
+                    let name = &parameter.name;
+                    return Err(error)
+                        .context(format!("Failed confirming parameter {name} after set"));
                 }
             };
 
-            let (Ok(sent_value), Ok(recv_value)) = (
+            let (Ok(got_value), Ok(sent_value)) = (
                 recv_parameter.param_value(encoding),
                 parameter.param_value(encoding),
             ) else {
-                warn!("Failed checking param!");
-
-                continue;
+                let name = &parameter.name;
+                return Err(anyhow!("Failed checking param values for {name} after set"));
             };
 
-            if recv_value != sent_value {
+            if got_value != sent_value {
                 return Err(anyhow!(
-                    "Failed setting parameter {:?}: Autopilot didn't accept the value: Sent {sent_value:?}, got {recv_value:?}",
+                    "Failed setting parameter {:?}: Autopilot didn't accept the value: Sent {sent_value:?}, got {got_value:?}",
                     parameter.name
                 ));
             }
@@ -472,5 +505,23 @@ impl MavlinkComponent {
     #[instrument(level = "debug", skip(self))]
     pub async fn encoding(&self) -> ParamEncodingType {
         *self.inner.encoding.read().await
+    }
+}
+
+pub(crate) fn observe_param_value_from_sync(parameter: &Parameter, param_index: u16) {
+    let under_apply = crate::manager::CONFIG_APPLY.try_lock().is_err();
+    if under_apply || param_index != u16::MAX {
+        return;
+    }
+    for (camera_uuid, expected) in
+        crate::manager::owned_parameters::expectations_for_param(&parameter.name)
+    {
+        crate::health::observe_owned_parameter_value(
+            &camera_uuid,
+            &parameter.name,
+            &parameter.value,
+            &expected,
+            crate::health::ObserveSource::LiveChange,
+        );
     }
 }

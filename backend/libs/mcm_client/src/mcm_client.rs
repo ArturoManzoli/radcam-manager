@@ -7,24 +7,32 @@ use tracing::*;
 use crate::mcm_types::{
     ApiVideoSource, AuthenticateOnvifDeviceRequest, CaptureConfiguration, Format, Info,
     OnvifDevice, OnvifDeviceInformation, PostStream, RemoveStream, StreamInformation, StreamStatus,
-    UnauthenticateOnvifDeviceRequest, VideoCaptureConfiguration, VideoEncodeType, VideoSourceOnvif,
-    VideoSourceOnvifType, VideoSourceType,
+    VideoCaptureConfiguration, VideoEncodeType, VideoSourceOnvif, VideoSourceOnvifType,
+    VideoSourceType,
 };
 
 use super::{Camera, Credentials, Stream};
 
+const KNOWN_BR4KCAM_HARDWARE: &[&str] = &["HW0100302", "HW20200610"];
+
+/// MCM ships as its own BlueOS extension on its own release cadence, so this must not
+/// be a caret range: `"0.2.4"` means `>=0.2.4, <0.3.0`, which locks every camera out
+/// the day MCM releases 0.3.0.
+const SUPPORTED_MCM_VERSIONS: &str = ">=0.2.4";
+
 pub struct MCMClient {
     pub address: SocketAddr,
+    skip_hardware_check: bool,
     _info: Info,
 }
 
 impl MCMClient {
     #[instrument(level = "debug")]
-    pub async fn try_new(address: &SocketAddr) -> Result<Self> {
+    pub async fn try_new(address: &SocketAddr, skip_hardware_check: bool) -> Result<Self> {
         let _info = Self::get_info(address).await?;
 
         let version = semver::Version::parse(&_info.version)?;
-        let supported = semver::VersionReq::parse("0.2.4")?;
+        let supported = semver::VersionReq::parse(SUPPORTED_MCM_VERSIONS)?;
 
         if !supported.matches(&version) {
             return Err(anyhow!(
@@ -34,6 +42,7 @@ impl MCMClient {
 
         Ok(Self {
             address: *address,
+            skip_hardware_check,
             _info,
         })
     }
@@ -49,12 +58,12 @@ impl MCMClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn get_radcams(&self) -> Result<Vec<Camera>> {
+    pub async fn get_br4kcams(&self) -> Result<Vec<Camera>> {
         let devices = self.get_onvif_devices().await?;
 
-        let radcam_devices = radcams_from_onvif_devices(devices);
+        let br4kcam_devices = br4kcams_from_onvif_devices(devices, self.skip_hardware_check);
 
-        Ok(radcam_devices)
+        Ok(br4kcam_devices)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -63,7 +72,7 @@ impl MCMClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn get_radcam_video_sources(&self) -> Result<Vec<ApiVideoSource>> {
+    pub async fn get_br4kcam_video_sources(&self) -> Result<Vec<ApiVideoSource>> {
         let sources = self
             .get_video_sources()
             .await?
@@ -80,8 +89,8 @@ impl MCMClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn get_radcam_streams(&self) -> Result<Vec<Stream>> {
-        let radcam_streams = self
+    pub async fn get_br4kcam_streams(&self) -> Result<Vec<Stream>> {
+        let br4kcam_streams = self
             .get_streams()
             .await?
             .into_iter()
@@ -120,9 +129,11 @@ impl MCMClient {
                 let stream_endpoints = device.video_and_stream.stream_information.endpoints;
 
                 Some(Stream {
-                    name: name.to_owned(),
+                    name: device.video_and_stream.name.clone(),
                     source_endpoint,
                     stream_endpoints,
+                    state: device.state,
+                    error: device.error.clone(),
                 })
             })
             .collect::<Vec<Stream>>();
@@ -134,7 +145,7 @@ impl MCMClient {
         //     .flat_map(|stream| stream.video_and_stream.stream_information.endpoints)
         //     .collect::<Vec<Url>>();
 
-        Ok(radcam_streams)
+        Ok(br4kcam_streams)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -151,17 +162,21 @@ impl MCMClient {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub(crate) async fn unauthenticate(&self, camera: &Camera) -> Result<()> {
-        let data = UnauthenticateOnvifDeviceRequest {
-            device_uuid: camera.uuid,
-        };
-
-        web_client::delete(&self.address, "onvif/authentication", (), data).await
+    async fn get_streams(&self) -> Result<Vec<StreamStatus>> {
+        web_client::get(&self.address, "streams", (), ()).await
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn get_streams(&self) -> Result<Vec<StreamStatus>> {
-        web_client::get(&self.address, "streams", (), ()).await
+    pub async fn delete_stream(&self, name: &str) -> Result<Vec<StreamStatus>> {
+        web_client::delete(
+            &self.address,
+            "delete_stream",
+            (),
+            RemoveStream {
+                name: name.to_owned(),
+            },
+        )
+        .await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -193,10 +208,10 @@ impl MCMClient {
         };
 
         let data = PostStream {
-            name: format!("RadCam {id}"),
+            name: format!("4K Cam {id}"),
             source: source.source,
             stream_information: StreamInformation {
-                endpoints: vec![format!("rtsp://0.0.0.0:8554/radcam_{id}").parse()?],
+                endpoints: vec![format!("rtsp://0.0.0.0:8554/br4kcam_{id}").parse()?],
                 configuration: CaptureConfiguration::Video(VideoCaptureConfiguration {
                     encode,
                     height: size.height,
@@ -209,30 +224,28 @@ impl MCMClient {
 
         web_client::post(&self.address, "streams", data, ()).await
     }
-
-    #[instrument(level = "debug", skip(self))]
-    async fn delete_stream(&self) -> Result<Vec<Camera>> {
-        let data = RemoveStream { name: todo!() };
-
-        let devices = web_client::delete(&self.address, "delete_stream", (), data).await?;
-
-        Ok(radcams_from_onvif_devices(devices))
-    }
 }
 
-fn radcams_from_onvif_devices(devices: Vec<OnvifDevice>) -> Vec<Camera> {
+fn br4kcams_from_onvif_devices(
+    devices: Vec<OnvifDevice>,
+    skip_hardware_check: bool,
+) -> Vec<Camera> {
     devices
         .iter()
         .filter_map(|device| {
-            if device.name != Some("hd".to_string())
-                || device.hardware != Some("HW0100302".to_string())
-            {
+            let hardware_ok = skip_hardware_check
+                || device
+                    .hardware
+                    .as_deref()
+                    .is_some_and(|hardware| KNOWN_BR4KCAM_HARDWARE.contains(&hardware));
+
+            if device.name != Some("hd".to_string()) || !hardware_ok {
                 trace!("Skipping unknown {device:?}");
 
                 return None;
             };
 
-            trace!("RadCam found: {device:?}");
+            trace!("4K Cam found: {device:?}");
 
             Some(Camera {
                 hostname: device.ip,
@@ -245,4 +258,19 @@ fn radcams_from_onvif_devices(devices: Vec<OnvifDevice>) -> Vec<Camera> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_versions_are_not_capped_at_the_next_minor() {
+        let supported = semver::VersionReq::parse(SUPPORTED_MCM_VERSIONS).unwrap();
+
+        assert!(!supported.matches(&semver::Version::parse("0.2.3").unwrap()));
+        assert!(supported.matches(&semver::Version::parse("0.2.4").unwrap()));
+        assert!(supported.matches(&semver::Version::parse("0.3.0").unwrap()));
+        assert!(supported.matches(&semver::Version::parse("1.0.0").unwrap()));
+    }
 }

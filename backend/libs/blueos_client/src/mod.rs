@@ -15,6 +15,11 @@ struct Manager {
 /// Constructs our manager, Should be done inside main
 #[instrument(level = "debug")]
 pub async fn init(blueos_address: SocketAddr) {
+    if let Some(manager) = MANAGER.get() {
+        manager.write().await.blueos_address = blueos_address;
+        return;
+    }
+
     MANAGER.get_or_init(|| RwLock::new(Manager { blueos_address }));
 }
 
@@ -33,6 +38,14 @@ struct Endpoint {
 }
 
 pub async fn create_mavlink_endpoint(mavlink_endpoint: &str) -> Result<()> {
+    ensure_mavlink_endpoint(mavlink_endpoint).await.map(|_| ())
+}
+
+/// Make sure BlueOS still has our MAVLink endpoint.
+///
+/// Returns `Ok(true)` when the endpoint was created or rewritten, `Ok(false)` when
+/// it was already present and correct.
+pub async fn ensure_mavlink_endpoint(mavlink_endpoint: &str) -> Result<bool> {
     let blueos_address = MANAGER.get().unwrap().read().await.blueos_address;
 
     let desired_endpoint = {
@@ -53,8 +66,8 @@ pub async fn create_mavlink_endpoint(mavlink_endpoint: &str) -> Result<()> {
         };
 
         Endpoint {
-            name: "Radcam Manager".to_string(),
-            owner: "radcam-manager".to_string(),
+            name: "4K Cam Manager".to_string(),
+            owner: "br4kcam-manager".to_string(),
             connection_type: kind.to_string(),
             place: "0.0.0.0".to_string(),
             argument: port,
@@ -71,41 +84,66 @@ pub async fn create_mavlink_endpoint(mavlink_endpoint: &str) -> Result<()> {
             .await
             .context("Failed getting MAVLink endpoints from BlueOS")?;
 
+    // Match by owner+port (not display name) so renaming the endpoint does not create a duplicate.
     if let Some(existing_endpoint) = current_endpoints.iter().find(|current| {
-        (current.name == desired_endpoint.name) && (current.owner == desired_endpoint.owner)
+        current.owner == desired_endpoint.owner
+            && current.argument == desired_endpoint.argument
+            && current.connection_type == desired_endpoint.connection_type
+            && current.place == desired_endpoint.place
     }) {
         if desired_endpoint.eq(existing_endpoint) {
-            info!("MAVLink endpoint already present");
-
-            return Ok(());
+            debug!("MAVLink endpoint already present");
+            return Ok(false);
         }
 
         info!("MAVLink endpoint exists but needs to be reconfigured.");
 
-        return web_client::put(
+        web_client::put::<(), _, _>(
             &blueos_address,
             "ardupilot-manager/v1.0/endpoints/",
             vec![desired_endpoint],
             (),
         )
         .await
-        .context("Failed to create new MAVLink endpoint");
+        .context("Failed to create new MAVLink endpoint")?;
+        return Ok(true);
+    }
+
+    if let Some(legacy_endpoint) = current_endpoints.iter().find(|current| {
+        has_alphabetic_prefix(&current.name, "cam Manager")
+            && has_alphabetic_prefix(&current.owner, "cam-manager")
+    }) {
+        web_client::delete::<(), _, _>(
+            &blueos_address,
+            "ardupilot-manager/v1.0/endpoints/",
+            vec![legacy_endpoint.clone()],
+            (),
+        )
+        .await
+        .context("Failed to remove legacy MAVLink endpoint")?;
     }
 
     info!("MAVLink endpoint not present, creating it...");
 
-    web_client::post(
+    web_client::post::<(), _, _>(
         &blueos_address,
         "ardupilot-manager/v1.0/endpoints/",
         vec![desired_endpoint],
         (),
     )
     .await
-    .context("Failed to create new MAVLink endpoint")
+    .context("Failed to create new MAVLink endpoint")?;
+    Ok(true)
 }
 
 pub async fn reboot_autopilot() -> Result<()> {
     let blueos_address = MANAGER.get().unwrap().read().await.blueos_address;
 
     web_client::post(&blueos_address, "ardupilot-manager/v1.0/restart", (), ()).await
+}
+
+fn has_alphabetic_prefix(value: &str, suffix: &str) -> bool {
+    value
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()))
 }

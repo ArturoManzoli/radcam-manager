@@ -1,20 +1,21 @@
 <template>
-  <div class="flex w-full justify-between items-center">
+  <div class="flex w-full min-w-0 justify-between items-center">
     <div
       v-if="label"
-      class="min-w-[130px]"
+      class="min-w-[130px] shrink-0"
     >
       <label
+        :for="sliderId"
         class="text-start mr-6"
         :class="theme === 'dark' ? 'text-white' : 'text-black'"
       >{{ label }}</label>
     </div>
-    <div class="flex justify-between items-center">
+    <div class="flex min-w-0 flex-1 items-center justify-between">
       <div
         name="slider-track"
-        class="relative overflow-visible rounded-[6px] elevation-1"
+        class="relative w-full min-w-0 overflow-visible rounded-[6px] elevation-1"
         :class="[theme === 'dark' ? 'bg-[#464646AA]' : 'bg-[#00000011]', disabled ? 'opacity-50' : '']"
-        :style="{ width: width || '100%', height: height || '30px', cursor: disabled ? 'not-allowed' : 'pointer' }"
+        :style="{ maxWidth: width || '100%', height: height || '30px', cursor: disabled ? 'not-allowed' : 'pointer' }"
       >
         <div class="absolute inset-x-[18%] top-1/2 -translate-y-1/2 flex justify-between pointer-events-none">
           <div
@@ -28,44 +29,50 @@
           />
         </div>
         <div
-          class="absolute translate-y-1/2 bottom-1/2 text-white text-center text-[14px] min-w-[60px] py-[1px] rounded-[6px] elevation-1 z-50 h-3/4"
+          class="absolute translate-y-1/2 bottom-1/2 text-white text-center text-[14px] w-[4.5rem] min-w-[4.5rem] max-w-[4.5rem] shrink-0 py-[1px] rounded-[6px] elevation-1 z-50 h-3/4"
           :class="isEditingCurrentSliderValue ? 'pointer-events-auto' : 'pointer-events-none select-none'"
           :style="{
             left: pillLeft,
-            marginLeft: '5px',
             backgroundColor: color || '#0B5087',
           }"
         >
-          <div v-if="!isEditingCurrentSliderValue">
+          <div
+            v-if="!isEditingCurrentSliderValue"
+            class="flex h-full w-full items-center justify-center"
+          >
             <p
-              class="font-bold select-none"
+              class="font-bold select-none truncate px-0.5"
               draggable="false"
             >
               {{ formatDisplay ? formatDisplay(scaledValue) : scaledValue.toFixed(defaultDecimals) }}
             </p>
           </div>
-          <div v-else>
+          <div
+            v-else
+            class="flex h-full w-full items-center justify-center"
+          >
             <input
               ref="editInput"
               v-model.number="editedDisplayValue"
               type="number"
+              :aria-label="label"
               :min="displayMin"
               :max="displayMax"
               :step="displayStep"
               autofocus
-              class="bg-white border border-gray-300 rounded px-1 py-0.5"
+              class="box-border h-full w-full min-w-0 bg-white border border-gray-300 rounded px-0.5 py-0 text-center text-black"
               @input="clampEditedValue"
               @keydown="handleValueChange"
-              @blur="isEditingCurrentSliderValue = false"
+              @blur="onEditBlur"
             >
           </div>
         </div>
         <input
+          :id="sliderId"
           v-model.number="currentSliderValue"
           type="range"
           class="absolute inset-0 w-full h-full opacity-0"
           :class="disabled ? 'cursor-not-allowed' : 'cursor-pointer'"
-          style="width: 95%; left: 2.5%"
           :min="min"
           :max="max"
           :step="rawStep"
@@ -101,7 +108,7 @@
   </div>
 </template>
 <script setup lang="ts">
-import { ref, watch, onBeforeUnmount, computed } from 'vue'
+import { ref, watch, onBeforeUnmount, computed, useId } from 'vue'
 
 const props = defineProps<{
   /** Pill color override. */
@@ -143,6 +150,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'update:modelValue', value: number | null): void
 }>()
+
+const editInput = ref<HTMLInputElement | null>(null)
+const sliderId = useId()
 
 const decimalsFromStep = (step: number): number => {
   if (!Number.isFinite(step) || step <= 0) return 0
@@ -253,20 +263,25 @@ const approxEqual = (a: number, b: number): boolean => {
 
 // Pill position logic
 const fillWidth = computed(() => {
+  const span = props.max - props.min
+  if (!(span > 0)) return 0
   const val = currentSliderValue.value
-  return ((val - props.min) / (props.max - props.min)) * 100
+  return ((val - props.min) / span) * 100
 })
 const staticFillWidth = ref<number>(0)
 
-const pillLeft = computed(() =>                      
-  `calc((100% - 70px) * ${                           
-    (isEditingCurrentSliderValue.value               
+const pillLeft = computed(() =>
+  `calc((100% - 4.5rem) * ${
+    (isEditingCurrentSliderValue.value
       ? staticFillWidth.value
       : fillWidth.value) / 100})`
 )
 
+const skipEditCommit = ref(false)
+
 const sendValue = (val: number) => {
-  if (val === lastSentValue.value) return
+  const eps = Math.max(1e-6, rawStep.value * 0.25)
+  if (Math.abs(val - lastSentValue.value) <= eps) return
   lastSentValue.value = val
   emit('update:modelValue', val)
 }
@@ -285,7 +300,8 @@ const clearCommitLock = (): void => {
 }
 
 const setCommitLock = (val: number): void => {
-  const lockMs = 2000
+  // Short lock: ignore echo of our own commit without freezing correlation-driven updates.
+  const lockMs = 400
   commitLockValue.value = val
   commitLockUntilMs.value = Date.now() + lockMs
   if (commitLockTimeout) clearTimeout(commitLockTimeout)
@@ -309,7 +325,11 @@ const onSliderChange = (): void => {
 
 // Clamp during input
 const clampEditedValue = () => {
-  editedDisplayValue.value = Math.min(Math.max(editedDisplayValue.value, displayMin.value), displayMax.value)
+  if (!Number.isFinite(editedDisplayValue.value)) return
+  editedDisplayValue.value = Math.min(
+    Math.max(editedDisplayValue.value, displayMin.value),
+    displayMax.value,
+  )
 }
 
 let throttleTimeout: number | null = null
@@ -344,6 +364,9 @@ const flushPendingValue = (): void => {
 }
 
 const endInteracting = (): void => {
+  window.removeEventListener('pointerup', handlePointerUp)
+  window.removeEventListener('pointercancel', handlePointerCancel)
+  if (!isInteracting.value) return
   isInteracting.value = false
 
   const clamped = Math.min(Math.max(currentSliderValue.value, props.min), props.max)
@@ -359,10 +382,11 @@ const handlePointerCancel = (): void => endInteracting()
 
 const startInteracting = (): void => {
   if (props.disabled || isEditingCurrentSliderValue.value) return
+  if (isInteracting.value) return
   isInteracting.value = true
   clearCommitLock()
-  window.addEventListener('pointerup', handlePointerUp, { once: true })
-  window.addEventListener('pointercancel', handlePointerCancel, { once: true })
+  window.addEventListener('pointerup', handlePointerUp)
+  window.addEventListener('pointercancel', handlePointerCancel)
 }
 
 const isArrowKey = (key: string): boolean =>
@@ -408,15 +432,26 @@ const onRangeKeyup = (e: KeyboardEvent): void => {
   endInteracting()
 }
 
-// Keyboard handling
+// Keyboard handling for the edit input.
 const handleValueChange = (e: KeyboardEvent): void => {
   if (e.key === 'Escape') {
-    isEditingCurrentSliderValue.value = false
+    // Restore before leaving edit mode so the edit watcher does not commit.
     editedDisplayValue.value = props.scaleFn ? props.scaleFn(lastSentValue.value) : lastSentValue.value
     currentSliderValue.value = lastSentValue.value
+    skipEditCommit.value = true
+    isEditingCurrentSliderValue.value = false
   } else if (e.key === 'Enter') {
     isEditingCurrentSliderValue.value = false
   }
+}
+
+// Native number spinners fire blur before they apply the step. Defer leaving
+// edit mode long enough for the spinner mouseup/input to update the value.
+const onEditBlur = (): void => {
+  window.setTimeout(() => {
+    if (document.activeElement === editInput.value) return
+    isEditingCurrentSliderValue.value = false
+  }, 150)
 }
 
 // Sync from parent
@@ -427,12 +462,17 @@ watch(
     if (isEditingCurrentSliderValue.value || isInteracting.value) return
     if (
       commitLockValue.value !== null &&
-      Date.now() < commitLockUntilMs.value &&
-      !approxEqual(next, commitLockValue.value)
+      Date.now() < commitLockUntilMs.value
     ) {
-      return
+      if (approxEqual(next, commitLockValue.value)) {
+        // Echo of our own commit — already showing it.
+        return
+      }
+      // Foreign / correlation-driven update — take it.
+      clearCommitLock()
     }
     currentSliderValue.value = next
+    lastSentValue.value = next
   },
   { immediate: true }
 )
@@ -442,6 +482,13 @@ watch(isEditingCurrentSliderValue, (isEditing) => {
     editedDisplayValue.value = displayValue.value
     staticFillWidth.value = fillWidth.value
   } else {
+    if (skipEditCommit.value) {
+      skipEditCommit.value = false
+      return
+    }
+    if (!Number.isFinite(editedDisplayValue.value)) {
+      editedDisplayValue.value = displayValue.value
+    }
     const raw = props.unscaleFn ? props.unscaleFn(editedDisplayValue.value) : editedDisplayValue.value
     currentSliderValue.value = Math.min(Math.max(raw, props.min), props.max)
     sendValue(currentSliderValue.value)

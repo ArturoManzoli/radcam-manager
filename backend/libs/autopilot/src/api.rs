@@ -29,6 +29,8 @@ pub enum Action {
     SetActuatorsConfig(ActuatorsConfig),
     #[serde(rename = "resetActuatorsConfig")]
     ResetActuatorsConfig,
+    #[serde(rename = "forgetActuatorsConfig")]
+    ForgetActuatorsConfig,
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone, Copy, TS)]
@@ -145,8 +147,8 @@ pub enum TiltChannelFunction {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[repr(u8)]
 pub enum MountType {
-    Servo = 1,
     #[default]
+    Servo = 1,
     BrushlessPWM = 7,
 }
 

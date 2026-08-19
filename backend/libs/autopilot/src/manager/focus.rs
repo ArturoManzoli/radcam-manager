@@ -1,17 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use tracing::*;
 use uuid::Uuid;
 
 use crate::{
     api, generate_update_channel_param_function,
     manager::Manager,
-    parameters::{ChannelFunction, ParamType},
+    parameters::{ActuatorsParameters, ChannelFunction, ParamType},
 };
 
 impl Manager {
-    #[instrument(level = "debug", skip(self, parameters))]
+    #[instrument(level = "debug", skip(parameters))]
     pub async fn update_focus_parameters(
-        &mut self,
         camera_uuid: &Uuid,
         parameters: &api::ActuatorsParametersConfig,
         overwrite: bool,
@@ -19,20 +19,34 @@ impl Manager {
         let mut autopilot_reboot_required = overwrite;
 
         if let Some(channel) = &parameters.focus_channel {
-            let current_parameters = &mut self
-                .settings
-                .actuators
-                .entry(*camera_uuid)
-                .or_default()
-                .parameters;
-            let encoding = self.mavlink.encoding().await;
+            // Snapshot under a short write with no await inside, so the MAVLink I/O
+            // below never runs while MANAGER is locked.
+            let (old_channel, script_function) = {
+                let mut manager = crate::manager::MANAGER
+                    .get()
+                    .context("Not available")?
+                    .write()
+                    .await;
+                let current_parameters = &mut manager
+                    .settings
+                    .actuators
+                    .entry(*camera_uuid)
+                    .or_default()
+                    .parameters;
+                (
+                    current_parameters.focus_channel,
+                    current_parameters.script_function,
+                )
+            };
+
+            let mavlink = crate::mavlink::component()?;
+            let encoding = mavlink.encoding().await;
 
             // Disables the old focus_channel:
-            if &current_parameters.focus_channel != channel {
-                let param_name =
-                    format!("SERVO{}_FUNCTION", current_parameters.focus_channel as u8);
+            if &old_channel != channel {
+                let param_name = format!("SERVO{}_FUNCTION", old_channel as u8);
 
-                let mut param = self.mavlink.get_param(&param_name, false).await?;
+                let mut param = mavlink.get_param(&param_name, false).await?;
                 let old_value = param.value;
                 param
                     .value
@@ -40,20 +54,18 @@ impl Manager {
                 let new_value = param.value;
 
                 if old_value != new_value {
-                    match self.mavlink.set_param(param).await {
+                    match mavlink.set_param(param).await {
                         Ok(_) => {
-                            if old_value != new_value {
-                                info!(
-                                    "focus_channel (SERVO{}) changed from {:?} to {new_value:?}",
-                                    current_parameters.focus_channel as u8, old_value
-                                );
-                                autopilot_reboot_required = true;
-                            }
+                            info!(
+                                "focus_channel (SERVO{}) changed from {:?} to {new_value:?}",
+                                old_channel as u8, old_value
+                            );
+                            autopilot_reboot_required = true;
                         }
                         Err(error) => {
-                            warn!(
-                                "Failed to disable the old focus channel when setting parameter: {error:?}"
-                            )
+                            return Err(error).context(
+                                "Failed to disable the old focus channel when setting parameter",
+                            );
                         }
                     }
                 }
@@ -64,11 +76,9 @@ impl Manager {
                 let param_name = format!("SERVO{}_FUNCTION", *channel as u8);
 
                 // The focus servo input is the script:
-                let function =
-                    ChannelFunction::try_from(current_parameters.script_function as u8 as i16)
-                        .unwrap();
+                let function = Self::focus_channel_function(script_function)?;
 
-                let mut param = self.mavlink.get_param(&param_name, false).await?;
+                let mut param = mavlink.get_param(&param_name, false).await?;
                 let old_value = param.value;
                 param
                     .value
@@ -76,53 +86,78 @@ impl Manager {
                 let new_value = param.value;
 
                 if overwrite || old_value != new_value {
-                    match self.mavlink.set_param(param).await {
+                    match mavlink.set_param(param).await {
                         Ok(_) => {
-                            if overwrite || old_value != new_value {
-                                info!(
-                                    "focus_channel (SERVO{}) changed from {:?} to {new_value:?}",
-                                    *channel as u8, old_value
-                                );
-                            }
+                            info!(
+                                "focus_channel (SERVO{}) changed from {:?} to {new_value:?}",
+                                *channel as u8, old_value
+                            );
 
-                            current_parameters.focus_channel = *channel;
+                            let mut manager = crate::manager::MANAGER
+                                .get()
+                                .context("Not available")?
+                                .write()
+                                .await;
+                            if let Some(actuators) = manager.settings.actuators.get_mut(camera_uuid)
+                            {
+                                actuators.parameters.focus_channel = *channel;
+                            }
                             autopilot_reboot_required = true;
                         }
                         Err(error) => {
-                            warn!(
-                                "Failed setting new focus channel parameter when setting parameter: {error:?}"
-                            )
+                            return Err(error).context(
+                                "Failed setting new focus channel parameter when setting parameter",
+                            );
                         }
                     }
                 }
             }
         }
 
-        self.update_focus_channel_parameters(camera_uuid, parameters, autopilot_reboot_required)
+        Self::update_focus_channel_parameters(camera_uuid, parameters, autopilot_reboot_required)
             .await?;
 
         Ok(autopilot_reboot_required)
     }
 
-    #[instrument(level = "debug", skip(self, parameters))]
+    #[instrument(level = "debug", skip(parameters))]
     async fn update_focus_channel_parameters(
-        &mut self,
         camera_uuid: &Uuid,
         parameters: &api::ActuatorsParametersConfig,
         force_apply: bool,
     ) -> Result<()> {
-        self.update_focus_channel_min(camera_uuid, parameters, force_apply)
-            .await?;
-        self.update_focus_channel_trim(camera_uuid, parameters, force_apply)
-            .await?;
-        self.update_focus_channel_max(camera_uuid, parameters, force_apply)
-            .await?;
+        Self::update_focus_channel_min(camera_uuid, parameters, force_apply).await?;
+        Self::update_focus_channel_trim(camera_uuid, parameters, force_apply).await?;
+        Self::update_focus_channel_max(camera_uuid, parameters, force_apply).await?;
 
         Ok(())
     }
 
+    fn focus_channel_function(script_function: api::ScriptFunction) -> Result<ChannelFunction> {
+        ChannelFunction::try_from(script_function as u8 as i16).map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid script_function {script_function:?} for focus channel: {error:?}"
+            )
+        })
+    }
+
+    fn expect_owned_focus_servo_function(
+        parameters: &ActuatorsParameters,
+        map: &mut IndexMap<String, ParamType>,
+    ) {
+        let Ok(function) = Self::focus_channel_function(parameters.script_function) else {
+            return;
+        };
+        let channel = parameters.focus_channel as u8;
+        map.insert(
+            format!("SERVO{channel}_FUNCTION"),
+            ParamType::INT16(function as i16),
+        );
+    }
+
     generate_update_channel_param_function!(
         update_focus_channel_min,
+        expect_owned_focus_channel_min,
         focus_channel_min,
         "SERVO",
         "MIN",
@@ -132,6 +167,7 @@ impl Manager {
 
     generate_update_channel_param_function!(
         update_focus_channel_max,
+        expect_owned_focus_channel_max,
         focus_channel_max,
         "SERVO",
         "MAX",
@@ -141,10 +177,21 @@ impl Manager {
 
     generate_update_channel_param_function!(
         update_focus_channel_trim,
+        expect_owned_focus_channel_trim,
         focus_channel_trim,
         "SERVO",
         "TRIM",
         UINT16,
         focus_channel
     );
+}
+
+pub(super) fn push_owned_expectations(
+    parameters: &ActuatorsParameters,
+    map: &mut IndexMap<String, ParamType>,
+) {
+    Manager::expect_owned_focus_servo_function(parameters, map);
+    Manager::expect_owned_focus_channel_min(parameters, map);
+    Manager::expect_owned_focus_channel_trim(parameters, map);
+    Manager::expect_owned_focus_channel_max(parameters, map);
 }

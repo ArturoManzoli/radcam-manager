@@ -1,6 +1,8 @@
 mod connection;
 pub mod parameters;
 
+pub use connection::Message;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -9,16 +11,32 @@ use mavlink::{
     self, MavHeader, Message as _, MessageData,
     ardupilotmega::{COMMAND_LONG_DATA, MavCmd, MavMessage, MavResult, SERVO_OUTPUT_RAW_DATA},
 };
+use once_cell::sync::OnceCell;
 use tokio::sync::{RwLock, broadcast};
 use tracing::*;
 
 use crate::{
-    mavlink::{
-        connection::{Connection, Message},
-        parameters::ParamEncodingType,
-    },
+    mavlink::{connection::Connection, parameters::ParamEncodingType},
     parameters::{ParamType, Parameter},
 };
+
+/// Process-lifetime owner of MAVLink tasks. Never dropped while the process runs
+/// (soft restart keeps the existing connection string).
+static MAVLINK_COMPONENT: OnceCell<MavlinkComponent> = OnceCell::new();
+
+/// Shared MAVLink API. Independent of [`crate::manager::MANAGER`] so I/O need not
+/// hold the settings lock.
+pub fn component() -> Result<&'static MavlinkComponent> {
+    MAVLINK_COMPONENT
+        .get()
+        .context("MAVLink component not initialized")
+}
+
+pub(crate) fn init_component(component: MavlinkComponent) -> Result<()> {
+    MAVLINK_COMPONENT
+        .set(component)
+        .map_err(|_| anyhow!("MAVLink component already initialized"))
+}
 
 #[derive(Debug)]
 pub struct MavlinkComponent {
@@ -30,6 +48,10 @@ pub struct MavlinkComponent {
 }
 
 impl MavlinkComponent {
+    pub fn system_id(&self) -> u8 {
+        self.inner.system_id
+    }
+
     #[instrument(level = "debug")]
     pub async fn try_new(address: String, system_id: u8, component_id: u8) -> Result<Self> {
         let inner = Arc::new(ComponentInner::try_new(address, system_id, component_id).await?);
@@ -39,7 +61,10 @@ impl MavlinkComponent {
         let heartbeat_task_handle = tokio::spawn(Self::heartbeat_task(inner.clone()));
 
         Self::configure_parameter_encoding(inner.clone()).await;
+        crate::health::set_syncing(true);
+        crate::manager::owned_parameters::rebuild().await;
         Self::update_all_params(inner.clone()).await;
+        crate::health::set_syncing(false);
 
         let params_sync_task_handle = tokio::spawn(Self::params_sync_task(inner.clone()));
 
@@ -167,6 +192,10 @@ impl MavlinkComponent {
         let target_system = self.inner.system_id;
         let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
 
+        // The fresh run reports its own errors within seconds, so keeping the previous
+        // complaint would only leave the user's fix looking like it did nothing.
+        crate::health::clear_lua_script_failure();
+
         const SCRIPTING_CMD_STOP_AND_RESTART: u8 = 3;
         self.send_command(COMMAND_LONG_DATA {
             target_system,
@@ -181,7 +210,18 @@ impl MavlinkComponent {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn reboot_autopilot(&self) -> Result<()> {
-        // This is a workaround to this issue: https://github.com/bluerobotics/radcam-manager/issues/57
+        struct RebootingGuard;
+
+        impl Drop for RebootingGuard {
+            fn drop(&mut self) {
+                crate::health::set_rebooting(false);
+            }
+        }
+
+        crate::health::set_rebooting(true);
+        let _guard = RebootingGuard;
+
+        // This is a workaround to this issue: https://github.com/bluerobotics/br4kcam-manager/issues/57
         blueos_client::reboot_autopilot().await?;
 
         // FIXME: once the aforementioned issue is fixed, we can use the code below:
@@ -204,7 +244,18 @@ impl MavlinkComponent {
         self.wait_autopilot().await?;
 
         Self::configure_parameter_encoding(self.inner.clone()).await;
-        Self::update_all_params(self.inner.clone()).await;
+        crate::health::set_syncing(true);
+        crate::manager::owned_parameters::rebuild().await;
+        if tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            Self::update_all_params(self.inner.clone()),
+        )
+        .await
+        .is_err()
+        {
+            warn!("Timed out refreshing parameters after autopilot reboot");
+        }
+        crate::health::set_syncing(false);
 
         Ok(())
     }
@@ -216,7 +267,7 @@ impl MavlinkComponent {
         let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
         let mut receiver = self.inner.get_receiver().await;
 
-        let wait_command_ack = async {
+        let wait_heartbeat = async {
             loop {
                 use broadcast::error::RecvError;
 
@@ -224,7 +275,7 @@ impl MavlinkComponent {
                     Ok(Message::Received((recv_header, recv_message)))
                         if recv_header.system_id == target_system
                             && recv_header.component_id == target_component
-                            && matches!(recv_message, MavMessage::COMMAND_ACK(_)) =>
+                            && matches!(recv_message, MavMessage::HEARTBEAT(_)) =>
                     {
                         if let MavMessage::HEARTBEAT(heartbeat) = recv_message {
                             use mavlink::ardupilotmega::MavState;
@@ -253,19 +304,26 @@ impl MavlinkComponent {
             }
         };
 
-        match tokio::time::timeout(tokio::time::Duration::from_secs(15), wait_command_ack).await {
-            Ok(res) => return res,
+        match tokio::time::timeout(tokio::time::Duration::from_secs(15), wait_heartbeat).await {
+            Ok(res) => res,
             Err(_) => {
-                warn!("Timeout waiting for autopilot {target_system}:{target_component}, retrying");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                warn!(
+                    "Timeout waiting for autopilot {target_system}:{target_component} heartbeat; continuing"
+                );
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn send_command(&self, mut command: COMMAND_LONG_DATA) -> Result<()> {
+    pub async fn send_command(&self, command: COMMAND_LONG_DATA) -> Result<()> {
+        let _txn = self.inner.txn.lock().await;
+        self.send_command_locked(command).await
+    }
+
+    /// Send a command and wait for ACK. Caller must hold [`ComponentInner::txn`].
+    #[instrument(level = "debug", skip(self))]
+    async fn send_command_locked(&self, mut command: COMMAND_LONG_DATA) -> Result<()> {
         let target_system = self.inner.system_id;
         let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
         let this_system = self.inner.system_id;
@@ -331,13 +389,16 @@ impl MavlinkComponent {
 
             match tokio::time::timeout(tokio::time::Duration::from_secs(1), wait_command_ack).await
             {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(err)) => {
-                    if err.to_string().contains("MAV_RESULT_UNSUPPORTED") {
+                Ok(Ok(())) => {
+                    crate::health::rpc_ok();
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    if error.to_string().contains("MAV_RESULT_UNSUPPORTED") {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         continue;
                     }
-                    return Err(err);
+                    return Err(error);
                 }
                 Err(_) => {
                     warn!("Timeout for command {:?}, retrying", command.command);
@@ -345,23 +406,49 @@ impl MavlinkComponent {
             }
         }
 
-        Err(anyhow!(
+        let reason = format!(
             "Command {:?} timed out after {max_retries} retries",
             command.command
-        ))
+        );
+        crate::health::rpc_failed(&reason);
+        Err(anyhow!(reason))
     }
 
+    /// Subscribe to the shared MAVLink message broadcast for this component.
+    #[instrument(level = "debug", skip(self))]
+    pub async fn get_receiver(&self) -> broadcast::Receiver<Message> {
+        self.inner.get_receiver().await
+    }
+
+    /// Request the autopilot to stream `message_id` at `interval_us` microseconds.
+    #[instrument(level = "debug", skip(self))]
+    pub async fn set_message_interval(&self, message_id: u32, interval_us: f32) -> Result<()> {
+        let target_system = self.inner.system_id;
+        let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
+
+        self.send_command(COMMAND_LONG_DATA {
+            command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
+            target_system,
+            target_component,
+            confirmation: 0,
+            param1: message_id as f32,
+            param2: interval_us,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// One-shot request for `SERVO_OUTPUT_RAW`. Holds the mavlink txn for the whole RPC.
+    #[instrument(level = "debug", skip(self))]
     pub async fn request_servo_output_raw(&self) -> Result<SERVO_OUTPUT_RAW_DATA> {
         let target_system = self.inner.system_id;
         let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
 
-        let wait_servo_output_raw_handle = tokio::spawn({
-            let inner = self.inner.clone();
+        let _txn = self.inner.txn.lock().await;
+        // Subscribe before send so the first SERVO frame cannot be missed.
+        let mut receiver = self.inner.get_receiver().await;
 
-            Self::wait_servo_output_raw(inner)
-        });
-
-        self.send_command(COMMAND_LONG_DATA {
+        self.send_command_locked(COMMAND_LONG_DATA {
             command: MavCmd::MAV_CMD_REQUEST_MESSAGE,
             target_system,
             target_component,
@@ -371,16 +458,14 @@ impl MavlinkComponent {
         })
         .await?;
 
-        wait_servo_output_raw_handle.await?
+        Self::wait_servo_output_raw_on(&mut receiver, target_system, target_component).await
     }
 
-    pub async fn wait_servo_output_raw(
-        inner: Arc<ComponentInner>,
+    async fn wait_servo_output_raw_on(
+        receiver: &mut broadcast::Receiver<Message>,
+        target_system: u8,
+        target_component: u8,
     ) -> Result<SERVO_OUTPUT_RAW_DATA> {
-        let target_system = inner.system_id;
-        let target_component = mavlink::ardupilotmega::MavComponent::MAV_COMP_ID_AUTOPILOT1 as u8;
-        let mut receiver = inner.get_receiver().await;
-
         let wait_message = async {
             loop {
                 use broadcast::error::RecvError;
@@ -413,7 +498,10 @@ impl MavlinkComponent {
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(1), wait_message).await {
             Ok(res) => res,
-            Err(_) => Err(anyhow!("Timeout waiting")),
+            Err(_) => {
+                crate::health::rpc_failed("SERVO_OUTPUT_RAW not delivered within 1s after ACK");
+                Err(anyhow!("Timeout waiting"))
+            }
         }
     }
 }
@@ -432,6 +520,9 @@ pub(crate) struct ComponentInner {
     pub component_id: u8,
     pub encoding: Arc<RwLock<ParamEncodingType>>,
     pub parameters: Arc<RwLock<IndexMap<String, Parameter>>>,
+    /// Serializes correlated MAVLink RPCs (command ACK / PARAM_VALUE matching).
+    /// Lock order: never acquire MANAGER while holding this.
+    pub txn: tokio::sync::Mutex<()>,
     connection: Connection,
 }
 
@@ -497,6 +588,7 @@ impl ComponentInner {
             component_id,
             encoding: Arc::new(RwLock::new(ParamEncodingType::default())),
             parameters: Arc::new(RwLock::new(IndexMap::with_capacity(2048))),
+            txn: tokio::sync::Mutex::new(()),
             connection,
         })
     }
@@ -510,4 +602,8 @@ impl ComponentInner {
     pub async fn get_receiver(&self) -> broadcast::Receiver<Message> {
         self.connection.get_receiver()
     }
+}
+
+pub(crate) fn reconnect_count() -> u64 {
+    connection::reconnect_count()
 }

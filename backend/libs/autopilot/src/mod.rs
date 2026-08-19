@@ -1,23 +1,37 @@
+mod actuators_watch;
 pub mod api;
+mod health;
 mod manager;
 mod mavlink;
 pub mod parameters;
-pub mod routes;
 mod settings_translations;
 
 use anyhow::{Context, Result};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::*;
+use uuid::Uuid;
 
-pub use manager::init;
+pub use actuators_watch::{
+    add_interest as add_actuators_state_interest, cache_is_fresh as actuators_cache_is_fresh,
+    cached_actuators_state, interest_count as actuators_interest_count,
+    remove_interest as remove_actuators_state_interest, shutdown as shutdown_actuators_stream,
+    subscribe as subscribe_actuators_state,
+};
+pub use health::{
+    ParameterDrift, diagnostics, health, lua_script_status, lua_scripting_disabled,
+    needs_mavlink_endpoint_ensure, parameter_drifts, report_endpoint_setup, rpc_failed, rpc_ok,
+    set_backend_version, set_rebooting, set_syncing, subscribe_health,
+};
+pub use manager::{clear_saved_settings, init};
 
 use crate::{
     manager::MANAGER,
     parameters::{ActuatorsParameters, CLOSEST_POINTS, FURTHEST_POINTS},
 };
 
-pub use routes::router;
+/// Context message when a camera has no actuators entry yet.
+pub const ACTUATORS_NOT_CONFIGURED: &str = "Camera's actuators not configured";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct CameraActuators {
@@ -38,6 +52,33 @@ impl Default for CameraActuators {
     }
 }
 
+/// True when `message` (e.g. `format!("{error:?}")`) carries [`ACTUATORS_NOT_CONFIGURED`].
+pub fn error_indicates_actuators_not_configured(message: &str) -> bool {
+    message.contains(ACTUATORS_NOT_CONFIGURED)
+}
+
+/// UUIDs of every camera with persisted actuator settings, i.e. cameras this
+/// install expects to find. Empty when the manager is not up yet.
+pub async fn configured_cameras() -> Vec<Uuid> {
+    match MANAGER.get() {
+        Some(manager) => manager
+            .read()
+            .await
+            .settings
+            .actuators
+            .keys()
+            .copied()
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Shared entry point for REST and WebSocket autopilot control requests.
+#[instrument(level = "debug")]
+pub async fn handle_control(actuators_control: api::ActuatorsControl) -> Result<serde_json::Value> {
+    control_inner(Json(actuators_control)).await
+}
+
 #[instrument(level = "debug")]
 pub(crate) async fn control_inner(
     actuators_control: Json<api::ActuatorsControl>,
@@ -48,37 +89,141 @@ pub(crate) async fn control_inner(
 
     let res = match &actuators_control.action {
         Action::ExportLuaScript => {
-            let mut manager = MANAGER.get().context("Not available")?.write().await;
-
-            let reload_script = manager
-                .export_script(&actuators_control.camera_uuid, true)
-                .await?;
-
-            if reload_script {
-                manager.mavlink.reload_lua_scripts(true).await?;
-            }
-
-            let autopilot_reboot_required = manager.mavlink.enable_lua_script(false).await?;
-            if autopilot_reboot_required {
-                manager.mavlink.reboot_autopilot().await?;
-            }
+            let camera_uuid = actuators_control.camera_uuid;
+            manager::reboot_outside_apply(
+                Box::pin(async {
+                    let reload_script = manager::Manager::export_script(&camera_uuid, true).await?;
+                    manager::Manager::save_actuators_settings().await?;
+                    if reload_script {
+                        crate::mavlink::component()?
+                            .reload_lua_scripts(true)
+                            .await?;
+                    }
+                    crate::mavlink::component()?.enable_lua_script(false).await
+                }),
+                // Export already saved under apply; post-reboot finalize is a no-op.
+                Box::pin(async { Ok(()) }),
+            )
+            .await?;
 
             serde_json::to_value({})?
         }
         Action::GetActuatorsState => {
-            let mut manager = MANAGER.get().context("Not available")?.write().await;
+            // Prefer the SERVO watcher's cache when interest is on *and* a recent
+            // sample exists. Otherwise one-shot wait so subscribe/REST are not
+            // served stale defaults from disk.
+            if actuators_watch::interest_count() > 0
+                && actuators_watch::cache_is_fresh(actuators_control.camera_uuid)
+            {
+                let manager = MANAGER.get().context("Not available")?.read().await;
 
-            let state = manager.get_state(&actuators_control.camera_uuid).await?;
+                let actuators = manager
+                    .settings
+                    .actuators
+                    .get(&actuators_control.camera_uuid)
+                    .context(crate::ACTUATORS_NOT_CONFIGURED)?;
 
-            serde_json::to_value(state)?
+                serde_json::to_value(actuators.state)?
+            } else {
+                // Wait for SERVO under a read lock so the watcher can still write.
+                {
+                    let manager = MANAGER.get().context("Not available")?.read().await;
+                    let _ = manager
+                        .settings
+                        .actuators
+                        .get(&actuators_control.camera_uuid)
+                        .context(crate::ACTUATORS_NOT_CONFIGURED)?;
+                }
+                let age_before = actuators_watch::last_servo_age(actuators_control.camera_uuid);
+                let servo_output_raw = crate::mavlink::component()?
+                    .request_servo_output_raw()
+                    .await
+                    .context("Failed waiting for SERVO_OUTPUT_RAW_DATA message")?;
+                let mut manager = MANAGER.get().context("Not available")?.write().await;
+                let actuators = manager
+                    .settings
+                    .actuators
+                    .get_mut(&actuators_control.camera_uuid)
+                    .context(crate::ACTUATORS_NOT_CONFIGURED)?;
+                let state = manager::actuators_state_from_servo(actuators, &servo_output_raw);
+                let age_after = actuators_watch::last_servo_age(actuators_control.camera_uuid);
+                // Do not clobber a newer watcher sample that landed while we waited.
+                if !actuators_watch::servo_mark_advanced(age_before, age_after) {
+                    actuators.state = state;
+                    actuators_watch::mark_servo_from_get_state(actuators_control.camera_uuid);
+                    serde_json::to_value(state)?
+                } else {
+                    serde_json::to_value(actuators.state)?
+                }
+            }
         }
         Action::SetActuatorsState(new_state) => {
-            let mut manager = MANAGER.get().context("Not available")?.write().await;
-
-            let state = manager
-                .update_state(&actuators_control.camera_uuid, new_state)
-                .await?;
-
+            let camera_uuid = actuators_control.camera_uuid;
+            let focus_was_set = new_state.focus.is_some();
+            // Validate entry, then send MAVLink with no Manager lock held.
+            {
+                let manager = MANAGER.get().context("Not available")?.read().await;
+                let _ = manager
+                    .settings
+                    .actuators
+                    .get(&camera_uuid)
+                    .context(crate::ACTUATORS_NOT_CONFIGURED)?;
+            }
+            manager::Manager::apply_state_setpoints(new_state).await?;
+            let age_before = actuators_watch::last_servo_age(camera_uuid);
+            let servo_output_raw = crate::mavlink::component()?
+                .request_servo_output_raw()
+                .await
+                .context("Failed waiting for SERVO_OUTPUT_RAW_DATA message")?;
+            let state = {
+                let mut manager = MANAGER.get().context("Not available")?.write().await;
+                let actuators = manager
+                    .settings
+                    .actuators
+                    .get_mut(&camera_uuid)
+                    .context(crate::ACTUATORS_NOT_CONFIGURED)?;
+                let measured = manager::actuators_state_from_servo(actuators, &servo_output_raw);
+                let age_after = actuators_watch::last_servo_age(camera_uuid);
+                if !actuators_watch::servo_mark_advanced(age_before, age_after) {
+                    actuators.state = measured;
+                    actuators_watch::mark_servo_from_get_state(camera_uuid);
+                    measured
+                } else {
+                    actuators.state
+                }
+            };
+            // Health check waits for SERVO again — never under MANAGER.write().
+            if focus_was_set {
+                let enabled = {
+                    let manager = MANAGER.get().context("Not available")?.read().await;
+                    manager
+                        .settings
+                        .actuators
+                        .get(&camera_uuid)
+                        .is_some_and(|a| a.parameters.enable_focus_and_zoom_correlation)
+                };
+                if enabled {
+                    let health_servo = crate::mavlink::component()?
+                        .request_servo_output_raw()
+                        .await
+                        .ok();
+                    if let Some(health_servo) = health_servo {
+                        let needs_reload = {
+                            let mut manager = MANAGER.get().context("Not available")?.write().await;
+                            manager.apply_focus_script_health_sample(&camera_uuid, &health_servo)
+                        };
+                        if needs_reload {
+                            warn!("Attempting Lua script reload due to stale focus output");
+                            crate::health::note_script_reload();
+                            if let Err(error) =
+                                crate::mavlink::component()?.reload_lua_scripts(true).await
+                            {
+                                error!("Failed to reload Lua scripts: {error:?}");
+                            }
+                        }
+                    }
+                }
+            }
             serde_json::to_value(state)?
         }
         Action::GetActuatorsConfig => {
@@ -88,7 +233,7 @@ pub(crate) async fn control_inner(
                 .settings
                 .actuators
                 .get(&actuators_control.camera_uuid)
-                .context("Camera's actuators not configured")?
+                .context(crate::ACTUATORS_NOT_CONFIGURED)?
                 .into();
 
             serde_json::to_value(config)?
@@ -99,47 +244,126 @@ pub(crate) async fn control_inner(
             serde_json::to_value(config)?
         }
         Action::SetActuatorsConfig(new_config) => {
-            let mut manager = MANAGER.get().context("Not available")?.write().await;
-            let mut new_config = new_config.to_owned();
+            let camera_uuid = actuators_control.camera_uuid;
+            let new_config = {
+                let manager = MANAGER.get().context("Not available")?.read().await;
+                let base_config = manager
+                    .settings
+                    .actuators
+                    .get(&camera_uuid)
+                    .map(api::ActuatorsConfig::from)
+                    .unwrap_or(api::ActuatorsConfig::from(&CameraActuators::default()));
+                merge_struct::merge(&base_config, new_config).context("Failing to merge structs")?
+            };
 
-            let base_config = &manager
-                .settings
-                .actuators
-                .get(&actuators_control.camera_uuid)
-                .map(api::ActuatorsConfig::from)
-                .unwrap_or(api::ActuatorsConfig::from(&CameraActuators::default()));
+            manager::reboot_outside_apply(
+                Box::pin(async {
+                    manager::Manager::update_config(&camera_uuid, &new_config, false).await
+                }),
+                Box::pin(async {
+                    manager::Manager::finalize_config_after_reboot(
+                        &camera_uuid,
+                        new_config.parameters.as_ref(),
+                    )
+                    .await
+                }),
+            )
+            .await?;
 
-            new_config = merge_struct::merge(base_config, &new_config.clone())
-                .context("Failing to merge structs")?;
-
-            manager
-                .update_config(&actuators_control.camera_uuid, &new_config, false)
-                .await?;
-
+            let manager = MANAGER.get().context("Not available")?.read().await;
             let config: &api::ActuatorsConfig = &manager
                 .settings
                 .actuators
-                .get(&actuators_control.camera_uuid)
-                .context("Camera's actuators not configured")?
+                .get(&camera_uuid)
+                .context(crate::ACTUATORS_NOT_CONFIGURED)?
                 .into();
 
             serde_json::to_value(config)?
         }
         Action::ResetActuatorsConfig => {
-            let mut manager = MANAGER.get().context("Not available")?.write().await;
+            let camera_uuid = actuators_control.camera_uuid;
+            let default_params = api::ActuatorsConfig::from(&CameraActuators::default());
+            manager::reboot_outside_apply(
+                Box::pin(async { manager::Manager::reset_config(&camera_uuid).await }),
+                Box::pin(async {
+                    manager::Manager::finalize_config_after_reboot(
+                        &camera_uuid,
+                        default_params.parameters.as_ref(),
+                    )
+                    .await
+                }),
+            )
+            .await?;
 
-            manager.reset_config(&actuators_control.camera_uuid).await?;
-
+            let manager = MANAGER.get().context("Not available")?.read().await;
             let config: &api::ActuatorsConfig = &manager
                 .settings
                 .actuators
-                .get(&actuators_control.camera_uuid)
-                .context("Camera's actuators not configured")?
+                .get(&camera_uuid)
+                .context(crate::ACTUATORS_NOT_CONFIGURED)?
                 .into();
 
             serde_json::to_value(config)?
         }
+        Action::ForgetActuatorsConfig => {
+            let camera_uuid = actuators_control.camera_uuid;
+            let had_entry = MANAGER
+                .get()
+                .context("Not available")?
+                .read()
+                .await
+                .settings
+                .actuators
+                .contains_key(&camera_uuid);
+            if had_entry {
+                let default_params = api::ActuatorsConfig::from(&CameraActuators::default());
+                manager::reboot_outside_apply(
+                    Box::pin(async { manager::Manager::reset_config(&camera_uuid).await }),
+                    Box::pin(async {
+                        manager::Manager::finalize_config_after_reboot(
+                            &camera_uuid,
+                            default_params.parameters.as_ref(),
+                        )
+                        .await
+                    }),
+                )
+                .await?;
+            }
+
+            let _apply = manager::CONFIG_APPLY.lock().await;
+            let removed = {
+                let mut manager = MANAGER.get().context("Not available")?.write().await;
+                manager.settings.actuators.shift_remove(&camera_uuid)
+            };
+            if removed.is_some() {
+                manager::Manager::save_actuators_settings().await?;
+                info!(%camera_uuid, "Forgot actuators configuration for camera");
+
+                drop(_apply);
+                manager::owned_parameters::rebuild().await;
+                manager::owned_parameters::reevaluate_after_apply().await;
+            }
+            serde_json::Value::Null
+        }
     };
 
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::{ACTUATORS_NOT_CONFIGURED, error_indicates_actuators_not_configured};
+
+    #[test]
+    fn actuators_not_configured_message_is_stable() {
+        let error = anyhow!("missing entry").context(ACTUATORS_NOT_CONFIGURED);
+        assert!(error_indicates_actuators_not_configured(&format!(
+            "{error:?}"
+        )));
+        assert!(!error_indicates_actuators_not_configured(
+            "Camera actuators unavailable"
+        ));
+    }
 }

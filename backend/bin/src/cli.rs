@@ -41,14 +41,14 @@ pub struct Args {
     mcm_address: String,
 
     /// Sets the file path for the autopilot lua script to control zoom and focus
-    #[arg(long, default_value = "./scripts/radcam.lua", value_parser = expand::<String>)]
+    #[arg(long, default_value = "./scripts/br4kcam.lua", value_parser = expand::<String>)]
     autopilot_scripts_file: Option<String>,
 
     /// Sets the settings file path
     #[arg(
         long,
         value_name = "./settings.json",
-        default_value = "~/.config/radcam-manager/settings.json",
+        default_value = "~/.config/br4kcam-manager/settings.json",
         value_parser = expand::<String>,
     )]
     settings_file: String,
@@ -77,6 +77,10 @@ pub struct Args {
     /// Sets the BlueOS IP address.
     #[arg(long, default_value = "127.0.0.1", value_parser = expand::<String>)]
     blueos_address: String,
+
+    /// Accept any ONVIF device named "hd" without checking hardware ID.
+    #[arg(long, value_parser = expand::<bool>)]
+    mcm_skip_hardware_check: bool,
 }
 
 fn expand<T: std::str::FromStr>(s: &str) -> Result<T, String>
@@ -197,10 +201,15 @@ pub fn default_api_version() -> u8 {
 }
 
 #[instrument(level = "debug")]
+pub fn mcm_skip_hardware_check() -> bool {
+    args().mcm_skip_hardware_check
+}
+
+#[instrument(level = "debug")]
 pub async fn blueos_address() -> std::net::SocketAddr {
     let address = &args().blueos_address;
 
-    let (host, port) = address.split_once(':').unwrap_or((&address, "80"));
+    let (host, port) = address.split_once(':').unwrap_or((address, "80"));
     let address = format!("{host}:{port}");
 
     resolve_address(&address).await.unwrap()
